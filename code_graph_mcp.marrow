@@ -97,7 +97,7 @@ system CodeGraphMCP {
       line_count >= 0
     ]
     states: pending -> indexed -> stale -> ignored | deleted
-    index: [path]
+    index: [path, language]
   }
 
   // A repo registered in the cross-repo graph

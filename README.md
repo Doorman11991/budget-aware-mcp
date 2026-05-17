@@ -100,6 +100,7 @@ curl -fsSL https://raw.githubusercontent.com/CodeGraphContext/CodeGraphContext/m
 | **Retrieval** | BM25 keyword search | Hop-based graph walk with token budget |
 | **Token control** | None — returns everything | Agent specifies max tokens, retrieval stops there |
 | **Determinism** | BM25 scores vary | Same query = same result, always |
+| **Caching** | None | Semantic cache — "auth" ≈ "authentication" → cache hit |
 | **Scope check** | Not available | "Is this task feasible given the codebase?" |
 | **Impact analysis** | Git diff detection | Blast radius mapping (what DEPENDS on changed code) |
 | **Explain symbol** | Not available | One call: signature + callers + callees + location |
@@ -109,6 +110,19 @@ curl -fsSL https://raw.githubusercontent.com/CodeGraphContext/CodeGraphContext/m
 | **Session tracking** | Not available | Cumulative token spend across queries |
 | **Edge resolution** | 4117 edges (tree-sitter) | 3563 edges (regex + call resolution, no external deps) |
 | **Startup** | ~15ms (native C) | ~200ms (Node.js) — but 0.07ms per query once warm |
+
+## Semantic Cache
+
+Repeated or similar queries are served from cache without hitting the database:
+
+```
+Query 1: fuzzy_find_symbol("auth")       → 0.25ms (DB query)
+Query 2: fuzzy_find_symbol("authenticate") → 0.01ms (cache hit, similarity: 0.82)
+Query 3: search_graph("payment flow")     → 1.5ms (DB query)  
+Query 4: search_graph("payment processing") → 0.01ms (cache hit, similarity: 0.74)
+```
+
+Trigram-based Jaccard similarity. Threshold: 0.7. TTL: 5 minutes. Zero dependencies.
 
 ## Architecture
 

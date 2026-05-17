@@ -20,6 +20,7 @@ import { SimilarityFinder } from "./retrieval/similarity.js";
 import { SessionTracker } from "./tracking/session.js";
 import { Indexer } from "./index/indexer.js";
 import { CbmStore } from "./index/cbm_store.js";
+import { SemanticCache } from "./retrieval/semantic_cache.js";
 
 const server = new Server(
   { name: "budget-aware-mcp", version: "0.2.0" },
@@ -33,6 +34,7 @@ const clusters = new ClusterDiscovery(db);
 const similarity = new SimilarityFinder(db);
 const sessions = new SessionTracker(db);
 const indexer = new Indexer(db);
+const queryCache = new SemanticCache(0.7, 200, 300_000); // 5 min TTL
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // TOOL DEFINITIONS
@@ -275,6 +277,24 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   try {
     let result: any;
+
+    // Semantic cache: check if we've seen a similar query recently
+    const cacheableTools = ["fuzzy_find_symbol", "search_graph", "graph_walk", "find_by_path", "find_by_signature", "suggest_files"];
+    const cacheKey = cacheableTools.includes(name) ? `${name}:${JSON.stringify(args)}` : null;
+
+    if (cacheKey) {
+      const cached = queryCache.get(cacheKey);
+      if (cached) {
+        const queryMs = performance.now() - startMs;
+        const cachedResult = typeof cached.value === "object" && cached.value !== null ? cached.value : { data: cached.value };
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({ ...(cachedResult as any), _meta: { query_ms: Math.round(queryMs * 100) / 100, tokens_returned: 0, cached: true, similarity: Math.round(cached.similarity * 100) / 100 } }, null, 2),
+          }],
+        };
+      }
+    }
 
     // Try to find a CBM database for richer graph data (4000+ edges vs 100)
     const cbmStore = new CbmStore();
@@ -601,6 +621,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
 
     const queryMs = performance.now() - startMs;
+
+    // Cache the result for similar future queries
+    if (cacheKey && result) {
+      queryCache.set(cacheKey, result);
+    }
 
     // Track session stats
     const tokenEstimate = JSON.stringify(result).length / 4;
