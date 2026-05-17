@@ -264,6 +264,45 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         },
       },
     },
+    // ─── Code Access ─────────────────────────────────────────────────────
+    {
+      name: "get_code_snippet",
+      description: "Read the actual source code of a symbol or file. Returns the raw code with line numbers. Essential for understanding implementation details.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          symbol: { type: "string", description: "Symbol name to get code for. If not found, treats as file path." },
+          file_path: { type: "string", description: "File path (relative to repo root)" },
+          start_line: { type: "number", description: "Start line (optional, defaults to symbol start)" },
+          end_line: { type: "number", description: "End line (optional, defaults to symbol end)" },
+          max_lines: { type: "number", description: "Max lines to return. Default: 50", default: 50 },
+        },
+      },
+    },
+    {
+      name: "search_code",
+      description: "Full-text regex search across file contents. Like grep but returns structured results with context.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          pattern: { type: "string", description: "Regex pattern to search for" },
+          file_pattern: { type: "string", description: "File glob to restrict search (e.g. '*.ts'). Default: all files" },
+          max_results: { type: "number", description: "Max matches. Default: 20", default: 20 },
+        },
+        required: ["pattern"],
+      },
+    },
+    {
+      name: "delete_project",
+      description: "Remove an indexed repository from the graph database.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          name: { type: "string", description: "Repository name to delete" },
+        },
+        required: ["name"],
+      },
+    },
   ],
 }));
 
@@ -614,6 +653,130 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         `).all(maxResults) as any[];
 
         result = { dead_symbols: dead, count: dead.length, note: "These symbols have zero inbound edges — nothing calls them." };
+        break;
+      }
+      // ─── Code Access ───────────────────────────────────────────────────
+      case "get_code_snippet": {
+        const symbolName = args?.symbol as string | undefined;
+        const filePath = args?.file_path as string | undefined;
+        const maxLines = Math.min(200, Math.max(1, (args?.max_lines as number) || 50));
+        const dbInst = db.instance;
+        const fs = await import("fs");
+        const path = await import("path");
+
+        let targetFile: string | null = null;
+        let startLine = (args?.start_line as number) || 0;
+        let endLine = (args?.end_line as number) || 0;
+
+        // Resolve symbol to file + lines
+        if (symbolName) {
+          const sym = dbInst.prepare(
+            "SELECT file_path, start_line, end_line FROM symbols WHERE name = ? OR fqn = ? OR fqn LIKE ? LIMIT 1"
+          ).get(symbolName, symbolName, `%${symbolName}%`) as any;
+          if (sym) {
+            targetFile = sym.file_path;
+            if (!startLine) startLine = sym.start_line;
+            if (!endLine) endLine = sym.end_line;
+          }
+        }
+
+        if (!targetFile && filePath) targetFile = filePath;
+        if (!targetFile) { result = { error: "Symbol or file not found" }; break; }
+
+        // Find the repo root for this file
+        const repos = dbInst.prepare("SELECT root_path FROM repositories").all() as any[];
+        let fullPath: string | null = null;
+        for (const repo of repos) {
+          const candidate = path.join(repo.root_path, targetFile);
+          if (fs.existsSync(candidate)) { fullPath = candidate; break; }
+        }
+
+        if (!fullPath) { result = { error: `File not found: ${targetFile}` }; break; }
+
+        // Read the file
+        const content = fs.readFileSync(fullPath, "utf-8");
+        const allLines = content.split("\n");
+
+        // Apply line range
+        const from = Math.max(0, (startLine || 1) - 1);
+        const to = Math.min(allLines.length, endLine || (from + maxLines));
+        const snippet = allLines.slice(from, to);
+
+        // Format with line numbers
+        const numbered = snippet.map((line, i) => `${(from + i + 1).toString().padStart(4)} | ${line}`).join("\n");
+
+        result = {
+          file: targetFile,
+          start_line: from + 1,
+          end_line: to,
+          total_lines: allLines.length,
+          code: numbered,
+          language: path.extname(targetFile).slice(1) || "text",
+        };
+        break;
+      }
+      case "search_code": {
+        const pattern = args?.pattern as string;
+        const filePattern = (args?.file_pattern as string) || "";
+        const maxResults = Math.min(50, Math.max(1, (args?.max_results as number) || 20));
+        const dbInst = db.instance;
+        const fs = await import("fs");
+        const path = await import("path");
+
+        let regex: RegExp;
+        try { regex = new RegExp(pattern, "gi"); }
+        catch { result = { error: `Invalid regex: ${pattern}` }; break; }
+
+        // Get all indexed files
+        const files = dbInst.prepare("SELECT path, repo_id FROM indexed_files").all() as any[];
+        const repos = dbInst.prepare("SELECT id, root_path FROM repositories").all() as any[];
+        const repoMap = new Map(repos.map((r: any) => [r.id, r.root_path]));
+
+        const matches: any[] = [];
+        for (const file of files) {
+          if (matches.length >= maxResults) break;
+          if (filePattern && !file.path.match(filePattern.replace(/\*/g, ".*"))) continue;
+
+          const rootPath = repoMap.get(file.repo_id);
+          if (!rootPath) continue;
+          const fullPath = path.join(rootPath, file.path);
+          if (!fs.existsSync(fullPath)) continue;
+
+          let content: string;
+          try { content = fs.readFileSync(fullPath, "utf-8"); } catch { continue; }
+
+          const lines = content.split("\n");
+          for (let i = 0; i < lines.length && matches.length < maxResults; i++) {
+            if (regex.test(lines[i])) {
+              const contextStart = Math.max(0, i - 1);
+              const contextEnd = Math.min(lines.length, i + 2);
+              matches.push({
+                file: file.path,
+                line: i + 1,
+                match: lines[i].trim().slice(0, 200),
+                context: lines.slice(contextStart, contextEnd).join("\n"),
+              });
+            }
+            regex.lastIndex = 0; // reset for global regex
+          }
+        }
+
+        result = { pattern, matches, total: matches.length };
+        break;
+      }
+      case "delete_project": {
+        const repoName = args?.name as string;
+        const dbInst = db.instance;
+
+        const repo = dbInst.prepare("SELECT id FROM repositories WHERE name = ?").get(repoName) as any;
+        if (!repo) { result = { error: `Repository not found: ${repoName}` }; break; }
+
+        dbInst.prepare("DELETE FROM symbols WHERE repo_id = ?").run(repo.id);
+        dbInst.prepare("DELETE FROM edges WHERE repo_id = ?").run(repo.id);
+        dbInst.prepare("DELETE FROM indexed_files WHERE repo_id = ?").run(repo.id);
+        dbInst.prepare("DELETE FROM repositories WHERE id = ?").run(repo.id);
+
+        result = { deleted: repoName, message: "Repository and all its data removed from the graph." };
         break;
       }
       default:

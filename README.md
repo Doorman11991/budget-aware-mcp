@@ -52,7 +52,7 @@ curl -fsSL https://raw.githubusercontent.com/CodeGraphContext/CodeGraphContext/m
 └───────────────────────────────┴─────────┴─────────┘
 ```
 
-## Tools (19)
+## Tools (22)
 
 ### Index Layer
 | Tool | Description |
@@ -87,6 +87,13 @@ curl -fsSL https://raw.githubusercontent.com/CodeGraphContext/CodeGraphContext/m
 | `explain_symbol` | One-shot: signature, callers, callees, location, connectivity |
 | `suggest_files` | "What files should I look at for this task?" |
 | `find_dead_code` | Symbols with zero inbound edges (nothing calls them) |
+| `get_code_snippet` | Read actual source code of a symbol/file with line numbers |
+| `search_code` | Full-text regex search across file contents with context |
+
+### Management
+| Tool | Description |
+|------|-------------|
+| `delete_project` | Remove an indexed repository from the graph |
 
 ### Session
 | Tool | Description |
