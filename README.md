@@ -92,32 +92,156 @@ Queries are sub-millisecond once the server is warm. Semantic cache makes repeat
 | `delete_project` | Remove an indexed repository from the graph |
 | `get_session_stats` | Cumulative token accounting across all queries |
 
-## Key Features
+## Key Features (unique to budget-aware-mcp)
 
-### Token Budget Enforcement
-Every retrieval tool respects a `max_tokens` parameter. The graph walk stops adding context the moment the budget is hit — the agent never gets more than it asked for.
+These features don't exist in [CodeGraphContext](https://github.com/CodeGraphContext/CodeGraphContext) or any other code MCP server. CodeGraphContext is a **required dependency** for full 155-language tree-sitter indexing — we build our retrieval layer on top of their index.
 
-### Semantic Cache
-Similar queries hit cache instantly:
+---
+
+### 1. Token Budget Per Query
+
+**Problem:** Other tools return everything they find. An agent asks "what's relevant to auth?" and gets 50,000 tokens of code. Most of it is irrelevant. The agent's context window overflows or it wastes money processing junk.
+
+**Our solution:** Every query has a `max_tokens` parameter. The graph walk starts at your anchor symbol, walks outward along real call/import edges, and stops adding context the moment the budget is hit.
+
 ```
-"auth"           → 0.25ms (DB query)
-"authentication" → 0.01ms (cache hit, similarity: 0.82)
+Agent: graph_walk("AuthService", hop_depth=2, max_tokens=8000)
+
+Result: 20 symbols across 12 files, exactly 7,998 tokens.
+        Stopped at hop 2 because adding the next symbol would exceed 8000.
 ```
-Trigram-based Jaccard similarity. Threshold: 0.7. TTL: 5 minutes. Zero dependencies.
 
-### 155-Language Support
-When [CodeGraphContext](https://github.com/CodeGraphContext/CodeGraphContext) is installed, indexing uses tree-sitter for full-fidelity parsing. Without it, the built-in regex parser covers ~30 languages at 86% edge coverage.
+The agent asked for 8000. It got 8000. Not 50,000. Not 3,000. Exactly what it asked for, filled with the most structurally-connected code first.
 
-### Deterministic Results
-Same query always returns same result. Alphabetical ordering within each hop level. No scores that drift. Reproducible, debuggable.
+---
 
-### Scope Check
-Before an agent tries to write code, it asks "do the symbols I need exist?" Pure graph lookup — no LLM. Prevents wasted generation on things that don't exist in the codebase.
+### 2. Token Accounting Per Session
 
-### Architecture Discovery
-`discover_subsystems` returns:
-- **Clusters**: major code areas grouped by directory
-- **Hotspots**: most-connected symbols (fan-in + fan-out)
+**Problem:** Agents have no idea how much context they've consumed across a conversation. After 10 queries they might have blown through 100k tokens without realizing it.
+
+**Our solution:** Every query is tracked. The agent can ask at any time: "how much have I spent?"
+
+```
+Agent: get_session_stats()
+
+Result:
+  total_queries: 8
+  total_tokens_returned: 24,500
+  repos_indexed: 2
+  coverage: 12% of codebase explored
+```
+
+This lets agents make smart decisions: "I've already seen 24k tokens — do I need more context or should I start generating?" Instead of blindly reading more files, the agent knows its budget.
+
+---
+
+### 3. Scope/Feasibility Check
+
+**Problem:** An agent decides to "refactor the PaymentProcessor class." It generates 200 lines of code referencing `PaymentProcessor`, `StripeAdapter`, and `WebhookHandler`. None of those exist in the codebase. The agent hallucinated the entire thing.
+
+**Our solution:** Before generating code, the agent asks "is this task doable?"
+
+```
+Agent: check_scope("refactor PaymentProcessor to support Stripe webhooks")
+
+Result:
+  feasibility: "unknown"
+  found_symbols: []
+  missing_symbols: ["PaymentProcessor", "Stripe", "webhook"]
+  confidence: 0.1
+
+→ Agent knows: these symbols don't exist. Don't generate code for them.
+```
+
+vs.
+
+```
+Agent: check_scope("refactor the Emitter class to support multiple targets")
+
+Result:
+  feasibility: "full"
+  found_symbols: ["Emitter"]
+  confidence: 0.95
+
+→ Agent knows: Emitter exists, go ahead.
+```
+
+Zero LLM calls. Pure graph lookup. Prevents wasted generation attempts.
+
+---
+
+### 4. Blast-Radius Impact Analysis
+
+**Problem:** Other tools detect "these files changed" (git diff). That's not useful for an agent planning a refactor — it needs to know "if I change THIS, what ELSE breaks?"
+
+**Our solution:** Given a list of changed files, walks the dependency graph backwards to find everything that depends on the changed code.
+
+```
+Agent: analyze_impact(changed_files=["auth.ts"], hop_depth=2)
+
+Result:
+  changed_symbols: ["AuthService", "validateToken", "refreshSession"]
+  blast_radius: 14 symbols across 8 files depend on these
+  affected_files: ["routes/user.ts", "middleware/auth.ts", "services/payment.ts", ...]
+```
+
+The agent now knows: "If I change auth.ts, I might break 8 other files. Let me check those too before I submit this PR."
+
+---
+
+### 5. Deterministic Ordering
+
+**Problem:** BM25 search scores change based on index state, document frequency, and other factors. The same query returns different results on different days. You can't reproduce a bug, you can't write reliable tests, you can't trust the output.
+
+**Our solution:** Same query, same result. Every time. No exceptions.
+
+How: within each hop level of the graph walk, symbols are sorted alphabetically by FQN. The walk is BFS (breadth-first), so hop 0 is always the anchor, hop 1 is always its direct connections sorted A-Z, hop 2 is always THEIR connections sorted A-Z.
+
+```
+Run 1: graph_walk("Emitter", 2, 8000) → [Emitter, emitBudget, emitCache, emitCheckpoint, ...]
+Run 2: graph_walk("Emitter", 2, 8000) → [Emitter, emitBudget, emitCache, emitCheckpoint, ...]
+Run 3: graph_walk("Emitter", 2, 8000) → [Emitter, emitBudget, emitCache, emitCheckpoint, ...]
+```
+
+Always the same. Debuggable. Reproducible. Testable.
+
+---
+
+### 6. Multi-Hop Walk With Budget Cutoff
+
+**Problem:** A flat search returns "here are 20 results ranked by keyword relevance." But code isn't flat — it's a graph. `AuthService` calls `TokenValidator` which calls `CryptoUtils`. You need to understand the CHAIN, not just individual matches.
+
+**Our solution:** Start at a symbol. Walk outward along actual call/import/inheritance edges. Each "hop" adds the next layer of connected code. Stop when the budget is full.
+
+```
+Hop 0: AuthService (the thing you asked about)
+Hop 1: validateToken, refreshSession, hashPassword (things AuthService calls)
+Hop 2: CryptoUtils, SessionStore, TokenBlacklist (things THOSE call)
+        ↑ stopped here — budget hit at 8000 tokens
+```
+
+This gives the agent a **connected subgraph** — not a flat list. It understands the call chain, the dependencies, the architecture. In 8000 tokens instead of reading 12 files manually (50,000+ tokens).
+
+---
+
+## Dependency: CodeGraphContext
+
+budget-aware-mcp uses [CodeGraphContext](https://github.com/CodeGraphContext/CodeGraphContext) as its indexing engine. When installed, it provides:
+- 155-language tree-sitter parsing
+- 4000+ edges per project (calls, imports, inheritance, usage)
+- Incremental re-indexing
+- 3D graph visualization (localhost:9749)
+
+Install it for best results:
+```bash
+# Windows
+powershell -c "irm https://raw.githubusercontent.com/CodeGraphContext/CodeGraphContext/main/install.ps1 | iex"
+
+# macOS/Linux
+curl -fsSL https://raw.githubusercontent.com/CodeGraphContext/CodeGraphContext/main/install.sh | bash
+```
+
+Without CodeGraphContext, budget-aware-mcp falls back to its built-in regex parser (~30 languages, 86% edge coverage). Everything still works — just fewer edges to walk.
 - **Entry points**: functions with high out-degree but low in-degree
 - **Language breakdown**: files and LOC per language
 
