@@ -1,5 +1,7 @@
 # code-graph-mcp
 
+[![npm](https://img.shields.io/npm/v/budget-aware-mcp)](https://www.npmjs.com/package/budget-aware-mcp)
+
 Model-agnostic code memory MCP server. Budget-aware graph retrieval for AI agents — sub-millisecond queries, token budgeting, deterministic results. No embeddings, no vector DB, no API keys.
 
 Built on [CodeGraphContext](https://github.com/CodeGraphContext/CodeGraphContext) for 155-language tree-sitter indexing. Replaces their retrieval layer with hop-based graph walks that respect token budgets.
@@ -26,7 +28,13 @@ Any AI agent (Claude, Cursor, Kiro, Aider, Codex, Gemini CLI, etc.) gets structu
 ## Install
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/code-graph-mcp.git
+npm install -g budget-aware-mcp
+```
+
+Or from source:
+
+```bash
+git clone https://github.com/Doorman11991/code-graph-mcp.git
 cd code-graph-mcp
 npm install
 npm run build
