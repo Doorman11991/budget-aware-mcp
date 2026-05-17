@@ -414,6 +414,61 @@ export class Indexer {
     });
     processAll();
 
+    // ─── Second pass: resolve call edges ─────────────────────────────────
+    // Now that all symbols are in the DB, scan files for function calls
+    // and resolve them against the symbol registry. This dramatically
+    // increases edge count (from ~100 to ~500+ for a typical project).
+    const resolveEdges = dbInst.transaction(() => {
+      // Build symbol lookup: name → fqn[]
+      const allSymbols = dbInst.prepare("SELECT name, fqn, file_path FROM symbols WHERE repo_id = ?").all(repoId) as any[];
+      const nameToFqns = new Map<string, string[]>();
+      for (const sym of allSymbols) {
+        const list = nameToFqns.get(sym.name) || [];
+        list.push(sym.fqn);
+        nameToFqns.set(sym.name, list);
+      }
+
+      // For each file, find function calls and resolve them
+      for (const filePath of files) {
+        const relativePath = path.relative(absPath, filePath).replace(/\\/g, "/");
+        let content: string;
+        try { content = fs.readFileSync(filePath, "utf-8"); } catch { continue; }
+
+        // Get symbols defined in this file (potential call sources)
+        const fileSymbols = allSymbols.filter((s: any) => s.file_path === relativePath);
+        if (fileSymbols.length === 0) continue;
+
+        // Find all identifier calls: word( pattern
+        const callPattern = /\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\(/g;
+        const calledNames = new Set<string>();
+        let match: RegExpExecArray | null;
+        while ((match = callPattern.exec(content)) !== null) {
+          const name = match[1];
+          // Skip common non-function keywords
+          if (["if", "for", "while", "switch", "catch", "function", "class", "return", "typeof", "import", "export", "const", "let", "var", "new", "throw"].includes(name)) continue;
+          calledNames.add(name);
+        }
+
+        // Resolve each call against the symbol registry
+        const sourceFqn = fileSymbols[0].fqn; // use first symbol in file as source
+        for (const calledName of calledNames) {
+          const targets = nameToFqns.get(calledName);
+          if (!targets) continue;
+          // Don't create self-edges
+          for (const targetFqn of targets) {
+            if (targetFqn === sourceFqn) continue;
+            // Don't create duplicate edges
+            const exists = dbInst.prepare("SELECT 1 FROM edges WHERE source_fqn = ? AND target_fqn = ? AND repo_id = ?").get(sourceFqn, targetFqn, repoId);
+            if (!exists) {
+              insertEdge.run(sourceFqn, targetFqn, "calls", 0.6, relativePath, repoId);
+              totalEdges++;
+            }
+          }
+        }
+      }
+    });
+    resolveEdges();
+
     const durationMs = Date.now() - startTime;
     dbInst.prepare(`
       UPDATE repositories SET file_count = ?, symbol_count = ?, edge_count = ?, total_loc = ?, languages = ?, last_indexed_at = datetime('now'), index_duration_ms = ?, state = 'indexed' WHERE id = ?
