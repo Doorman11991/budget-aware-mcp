@@ -76,6 +76,89 @@ Fork [DeusData/codebase-memory-mcp](https://github.com/DeusData/codebase-memory-
 
 ---
 
+## Fuzzy discovery + natural-language retrieval
+
+Graph walk handles 80% of queries (agent knows what it wants). The other 20% — fuzzy discovery, "I don't know what I'm looking for", cross-domain matching — is handled by a **second retrieval layer that uses the graph's own metadata as the search surface**. No embeddings. No vector DB.
+
+### Techniques (all run against indexed graph metadata, not raw files)
+
+| Technique | What it does | When it fires |
+|---|---|---|
+| **Symbol name search** | Fuzzy match on function/class/method names. `"auth"` → `AuthService`, `authenticateUser`, `isAuthenticated`, `auth_middleware` | Agent uses a natural-language term that doesn't map to an exact symbol |
+| **File path search** | Match against directory structure. `"payment"` → `src/payments/stripe.ts`, `lib/billing/invoice.ts` | Agent is exploring a domain, not a specific symbol |
+| **Docstring/comment search** | Indexed JSDoc, `//` comments, README fragments stored alongside their parent symbol | Agent describes intent in plain English |
+| **Type signature search** | "Something that takes a User and returns a Token" → grep the graph for `(User) → Token` shaped functions | Agent knows the shape but not the name |
+| **Neighborhood expansion** | "I found `AuthService` — what else lives near it?" → return hop=1 from the best match | Bridge from fuzzy match to precise graph walk |
+| **Cluster discovery** | "Show me the major subsystems" → top-N connected components by node count | Agent needs architectural overview |
+| **Structural similarity** | "Find something shaped like stripe.ts" → match by method-name patterns + type signatures | Cross-domain matching within a single language |
+
+### The flow for "I don't know what I'm looking for"
+
+```
+Agent: "I need to understand how errors are handled in this project"
+
+Step 1: Symbol name search
+        → finds: ErrorHandler, AppError, handleError, error_middleware,
+          ValidationError, HttpError
+
+Step 2: Pick the most-connected symbol as anchor
+        (ErrorHandler has highest in-degree = most things reference it)
+
+Step 3: Graph walk from ErrorHandler, depth=2
+        → returns the full error handling subsystem
+
+Result: 8 files, ~2000 tokens. Agent has complete error handling context
+        without reading every file in the project.
+```
+
+### Cross-domain semantic matching (no embeddings)
+
+```
+Agent: "Find code that does something LIKE payments/stripe.ts but for Shopify"
+
+Step 1: Index stripe.ts shape → extract interface:
+        { createCharge, refund, listTransactions, webhookHandler }
+
+Step 2: Search graph for symbols with similar method-name patterns:
+        create*, refund*, list*, *Handler
+
+Step 3: Rank matches by structural similarity:
+        same number of methods, similar type signatures, similar call patterns
+
+Result: "shopify_adapter.ts has 4/4 matching method patterns, confidence: high"
+```
+
+### Why this beats embeddings for code
+
+| | Graph + metadata search | Embedding search |
+|---|---|---|
+| **Precision** | "This function IS called by your target" (fact) | "These chunks are 0.87 similar" (score) |
+| **Explainability** | "Found via: name match → graph hop" | "Cosine similarity was high" (why?) |
+| **Determinism** | Same query = same result, always | Varies by embedding model version |
+| **Speed** | Sub-millisecond (SQLite index lookup) | 10-100ms (embedding + vector search) |
+| **Dependencies** | None (pure graph metadata) | Embedding model (500MB+) |
+| **False positives** | Low — structural relationships are facts | High — semantically similar ≠ relevant |
+
+### Known limitations (honest)
+
+- **Obfuscated/minified code** — names are meaningless. Embeddings fail here too.
+- **Very poorly named code** — `doStuff()`, `handle()`, `process()`. But call graph still works.
+- **Cross-language semantic matching** — "find the Python equivalent of this TypeScript class." v1 doesn't support this. If demand proves real, add optional local embedding model as a plugin in v2.
+- **Natural language that doesn't map to any code concept** — "find the thing that makes users happy." Not solvable by any retrieval system.
+
+### Implementation plan
+
+Fuzzy discovery is a **Phase 2.5** addition (between retrieval and budget tracking):
+
+1. `src/retrieval/fuzzy.ts` — symbol name search, file path search, type signature search
+2. `src/retrieval/cluster.ts` — connected component discovery, neighborhood expansion
+3. `src/retrieval/similarity.ts` — structural shape matching (method-name patterns)
+4. Integrate into MCP tools: `search_graph` uses fuzzy as a fallback when exact anchor fails
+5. New tool: `discover_subsystems` — returns the top-N architectural clusters
+6. New tool: `find_similar` — structural similarity search across the graph
+
+---
+
 ## Phase plan
 
 ### Phase 1 — Fork + strip (1-2 days)
@@ -99,6 +182,23 @@ Fork [DeusData/codebase-memory-mcp](https://github.com/DeusData/codebase-memory-
    - Pure heuristic (no LLM): checks if the task mentions symbols that exist in the graph
 3. Wire into MCP tools: replace `search_graph` / `query_graph` internals with our walk
 4. Test: same query returns same result across 100 runs (determinism)
+
+### Phase 2.5 — Fuzzy discovery layer (1-2 days)
+
+1. Implement `src/retrieval/fuzzy.ts`:
+   - Symbol name search (case-insensitive substring + camelCase splitting)
+   - File path search (directory structure as domain signal)
+   - Docstring/comment search (indexed alongside parent symbol in SQLite)
+   - Type signature search (pattern match on `(ParamType) → ReturnType` shapes)
+2. Implement `src/retrieval/cluster.ts`:
+   - Connected component discovery (top-N by node count = major subsystems)
+   - Neighborhood expansion (hop=1 from fuzzy match → bridge to graph walk)
+3. Implement `src/retrieval/similarity.ts`:
+   - Structural shape matching: extract method-name patterns + type signatures from a source symbol, find other symbols with similar patterns
+4. Integration: `search_graph` tool uses fuzzy as a fallback when exact anchor resolution fails
+5. New MCP tool: `discover_subsystems` — returns top-N architectural clusters with entry points
+6. New MCP tool: `find_similar` — "find code shaped like X" without embeddings
+7. Test: fuzzy query "auth" on a project with `AuthService` finds it in <1ms
 
 ### Phase 3 — Budget/cost tracking (1 day)
 
@@ -164,11 +264,12 @@ Fork [DeusData/codebase-memory-mcp](https://github.com/DeusData/codebase-memory-
 |---|---|---|
 | 1. Fork + strip | 1-2 days | nothing |
 | 2. Retrieval layer | 2-3 days | Phase 1 |
-| 3. Budget tracking | 1 day | Phase 2 |
+| 2.5. Fuzzy discovery | 1-2 days | Phase 2 |
+| 3. Budget tracking | 1 day | Phase 2.5 |
 | 4. Agent auto-config | 1 day | Phase 1 |
 | 5. Cross-repo | 1-2 days | Phase 2 |
 | 6. Polish + ship | 1-2 days | all |
-| **Total** | **7-11 days** | |
+| **Total** | **8-13 days** | |
 
 ---
 
