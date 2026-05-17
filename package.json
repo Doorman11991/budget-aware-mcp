@@ -17,6 +17,7 @@
     "build": "tsc",
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js",
+    "test": "tsx test/test.ts",
     "bench": "tsx bench/bench_inprocess.ts",
     "bench:compare": "tsx bench/fair_benchmark.ts"
   },
