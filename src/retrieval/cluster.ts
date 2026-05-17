@@ -1,17 +1,16 @@
-// Cluster Discovery — connected component analysis.
-// Find major subsystems by identifying strongly connected symbol groups.
+// Cluster Discovery + Architecture Analysis
+// Find major subsystems, hotspots, entry points, language breakdown.
 
 export class ClusterDiscovery {
   constructor(private db: any) {}
 
   /**
-   * Discover top-N architectural clusters by symbol connectivity.
-   * Returns the largest connected components with their entry points.
+   * Full architecture overview: clusters, hotspots, entry points, languages.
    */
   async discover(maxClusters: number): Promise<any> {
     const dbInst = this.db.instance;
 
-    // Get all symbols with their edge counts (in-degree + out-degree)
+    // Get all symbols with their edge counts
     const symbols = dbInst.prepare(`
       SELECT s.fqn, s.name, s.kind, s.file_path,
         (SELECT COUNT(*) FROM edges WHERE source_fqn = s.fqn) as out_degree,
@@ -25,24 +24,23 @@ export class ClusterDiscovery {
     `).all() as any[];
 
     if (symbols.length === 0) {
-      return { clusters: [], total_symbols: 0 };
+      return { clusters: [], hotspots: [], entry_points: [], languages: [], total_symbols: 0 };
     }
 
-    // Group symbols by directory (first-pass clustering by file locality)
+    // ─── Clusters (by directory) ─────────────────────────────────────
     const dirGroups = new Map<string, any[]>();
     for (const sym of symbols) {
-      const dir = sym.file_path.split(/[/\\]/).slice(0, -1).join("/");
+      const dir = sym.file_path.split(/[/\\]/).slice(0, -1).join("/") || "(root)";
       const group = dirGroups.get(dir) || [];
       group.push(sym);
       dirGroups.set(dir, group);
     }
 
-    // Sort groups by total connectivity (sum of degrees)
     const clusters = [...dirGroups.entries()]
       .map(([dir, syms]) => ({
         directory: dir,
         symbol_count: syms.length,
-        total_connectivity: syms.reduce((sum, s) => sum + s.out_degree + s.in_degree, 0),
+        total_connectivity: syms.reduce((sum: number, s: any) => sum + s.out_degree + s.in_degree, 0),
         entry_points: syms
           .sort((a: any, b: any) => (b.in_degree + b.out_degree) - (a.in_degree + a.out_degree))
           .slice(0, 3)
@@ -52,12 +50,53 @@ export class ClusterDiscovery {
       .sort((a, b) => b.total_connectivity - a.total_connectivity)
       .slice(0, maxClusters);
 
-    const totalSymbols = dbInst.prepare("SELECT COUNT(*) as cnt FROM symbols").get() as any;
+    // ─── Hotspots (most-connected symbols) ───────────────────────────
+    const hotspots = symbols
+      .slice(0, 10)
+      .map((s: any) => ({
+        name: s.name,
+        fqn: s.fqn,
+        kind: s.kind,
+        file: s.file_path,
+        fan_in: s.in_degree,
+        fan_out: s.out_degree,
+        total: s.in_degree + s.out_degree,
+      }));
+
+    // ─── Entry points (high out-degree, low in-degree = likely entry) ─
+    const entryPoints = symbols
+      .filter((s: any) => s.out_degree > 0 && s.in_degree <= 1)
+      .sort((a: any, b: any) => b.out_degree - a.out_degree)
+      .slice(0, 10)
+      .map((s: any) => ({
+        name: s.name,
+        fqn: s.fqn,
+        kind: s.kind,
+        file: s.file_path,
+        calls_out: s.out_degree,
+      }));
+
+    // ─── Language breakdown ──────────────────────────────────────────
+    const languages = dbInst.prepare(
+      "SELECT language, COUNT(*) as files, SUM(line_count) as lines FROM indexed_files WHERE language != '' GROUP BY language ORDER BY files DESC"
+    ).all() as any[];
+
+    // ─── Summary stats ───────────────────────────────────────────────
+    const totalSymbols = dbInst.prepare("SELECT COUNT(*) as c FROM symbols").get() as any;
+    const totalEdges = dbInst.prepare("SELECT COUNT(*) as c FROM edges").get() as any;
+    const totalFiles = dbInst.prepare("SELECT COUNT(*) as c FROM indexed_files").get() as any;
 
     return {
       clusters,
-      total_symbols: totalSymbols?.cnt || 0,
-      clusters_shown: clusters.length,
+      hotspots,
+      entry_points: entryPoints,
+      languages,
+      summary: {
+        total_symbols: totalSymbols?.c || 0,
+        total_edges: totalEdges?.c || 0,
+        total_files: totalFiles?.c || 0,
+        clusters_shown: clusters.length,
+      },
     };
   }
 
