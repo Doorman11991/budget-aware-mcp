@@ -215,6 +215,53 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         },
       },
     },
+    // ─── Context Tools ───────────────────────────────────────────────────
+    {
+      name: "get_file_context",
+      description: "Read a file with its full dependency context: the file's symbols + everything they import/call, within a token budget. Like reading a file but you also get everything it depends on.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          file_path: { type: "string", description: "File path (relative to repo root or absolute)" },
+          max_tokens: { type: "number", description: "Token budget for all context. Default: 8000", default: 8000 },
+          include_callers: { type: "boolean", description: "Also include things that call INTO this file. Default: false", default: false },
+        },
+        required: ["file_path"],
+      },
+    },
+    {
+      name: "explain_symbol",
+      description: "One-shot full explanation of a symbol: signature, location, what it calls, what calls it, which file, and where it fits in the architecture. Saves 3-4 separate tool calls.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          symbol: { type: "string", description: "Symbol name or FQN" },
+        },
+        required: ["symbol"],
+      },
+    },
+    {
+      name: "suggest_files",
+      description: "Given a task description, suggest which files are most relevant to look at. Ranks by symbol name matches + edge connectivity.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          task: { type: "string", description: "What you're trying to do (e.g. 'add rate limiting')" },
+          max_results: { type: "number", description: "Max files to suggest. Default: 10", default: 10 },
+        },
+        required: ["task"],
+      },
+    },
+    {
+      name: "find_dead_code",
+      description: "Find symbols with zero inbound edges — functions/classes that nothing calls. Useful for cleanup.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          max_results: { type: "number", description: "Max results. Default: 20", default: 20 },
+        },
+      },
+    },
   ],
 }));
 
@@ -383,6 +430,170 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       // ─── Budget & Session ──────────────────────────────────────────────
       case "get_session_stats": {
         result = sessions.getStats((args?.session_id as string) || "default");
+        break;
+      }
+      // ─── Context Tools ─────────────────────────────────────────────────
+      case "get_file_context": {
+        const filePath = args?.file_path as string;
+        const maxTokens = Math.max(100, (args?.max_tokens as number) || 8000);
+        const includeCallers = (args?.include_callers as boolean) || false;
+        const dbInst = db.instance;
+
+        // Find symbols in this file
+        const fileSymbols = dbInst.prepare(
+          "SELECT name, fqn, kind, start_line, end_line, byte_size FROM symbols WHERE file_path LIKE ? ORDER BY start_line"
+        ).all(`%${filePath}%`) as any[];
+
+        if (fileSymbols.length === 0) {
+          result = { file: filePath, symbols: [], dependencies: [], message: "No symbols found in this file" };
+          break;
+        }
+
+        // Get what these symbols call (outgoing edges)
+        const dependencies: any[] = [];
+        let tokensUsed = fileSymbols.reduce((sum: number, s: any) => sum + Math.ceil((s.byte_size || 200) / 4), 0);
+
+        for (const sym of fileSymbols) {
+          const outEdges = dbInst.prepare("SELECT target_fqn FROM edges WHERE source_fqn = ?").all(sym.fqn) as any[];
+          for (const edge of outEdges) {
+            if (tokensUsed >= maxTokens) break;
+            const target = dbInst.prepare("SELECT name, fqn, kind, file_path, start_line, end_line FROM symbols WHERE fqn = ?").get(edge.target_fqn) as any;
+            if (target && target.file_path !== filePath) {
+              dependencies.push(target);
+              tokensUsed += 50;
+            }
+          }
+        }
+
+        // Optionally get callers (incoming edges)
+        let callers: any[] = [];
+        if (includeCallers) {
+          for (const sym of fileSymbols) {
+            if (tokensUsed >= maxTokens) break;
+            const inEdges = dbInst.prepare("SELECT source_fqn FROM edges WHERE target_fqn = ?").all(sym.fqn) as any[];
+            for (const edge of inEdges) {
+              if (tokensUsed >= maxTokens) break;
+              const source = dbInst.prepare("SELECT name, fqn, kind, file_path FROM symbols WHERE fqn = ?").get(edge.source_fqn) as any;
+              if (source && source.file_path !== filePath) {
+                callers.push(source);
+                tokensUsed += 50;
+              }
+            }
+          }
+        }
+
+        result = {
+          file: filePath,
+          symbols: fileSymbols.map((s: any) => ({ name: s.name, kind: s.kind, line: s.start_line })),
+          dependencies: [...new Map(dependencies.map((d: any) => [d.fqn, d])).values()],
+          callers: includeCallers ? [...new Map(callers.map((c: any) => [c.fqn, c])).values()] : undefined,
+          tokens_used: tokensUsed,
+        };
+        break;
+      }
+      case "explain_symbol": {
+        const symbolName = args?.symbol as string;
+        const dbInst = db.instance;
+
+        // Resolve symbol
+        const sym = dbInst.prepare(
+          "SELECT name, fqn, kind, file_path, start_line, end_line, signature, byte_size FROM symbols WHERE name = ? OR fqn = ? OR fqn LIKE ? LIMIT 1"
+        ).get(symbolName, symbolName, `%${symbolName}%`) as any;
+
+        if (!sym) {
+          result = { error: `Symbol not found: ${symbolName}` };
+          break;
+        }
+
+        // Get callees (what it calls)
+        const callees = dbInst.prepare(
+          "SELECT target_fqn FROM edges WHERE source_fqn = ? ORDER BY target_fqn"
+        ).all(sym.fqn) as any[];
+
+        // Get callers (what calls it)
+        const callerEdges = dbInst.prepare(
+          "SELECT source_fqn FROM edges WHERE target_fqn = ? ORDER BY source_fqn"
+        ).all(sym.fqn) as any[];
+
+        // Resolve names
+        const calleeNames = callees.map((e: any) => {
+          const t = dbInst.prepare("SELECT name, file_path FROM symbols WHERE fqn = ?").get(e.target_fqn) as any;
+          return t ? `${t.name} (${t.file_path})` : e.target_fqn.split(".").pop();
+        });
+        const callerNames = callerEdges.map((e: any) => {
+          const s = dbInst.prepare("SELECT name, file_path FROM symbols WHERE fqn = ?").get(e.source_fqn) as any;
+          return s ? `${s.name} (${s.file_path})` : e.source_fqn.split(".").pop();
+        });
+
+        result = {
+          name: sym.name,
+          fqn: sym.fqn,
+          kind: sym.kind,
+          file: sym.file_path,
+          lines: `${sym.start_line}-${sym.end_line}`,
+          signature: sym.signature || null,
+          calls: calleeNames.slice(0, 20),
+          called_by: callerNames.slice(0, 20),
+          connectivity: callees.length + callerEdges.length,
+        };
+        break;
+      }
+      case "suggest_files": {
+        const task = args?.task as string;
+        const maxResults = Math.min(20, Math.max(1, (args?.max_results as number) || 10));
+        const dbInst = db.instance;
+
+        // Extract keywords from task
+        const words = task.toLowerCase().split(/\s+/).filter(w => w.length > 2);
+
+        // Score files by how many keyword-matching symbols they contain
+        const fileScores = new Map<string, { score: number; matches: string[] }>();
+
+        for (const word of words) {
+          const matches = dbInst.prepare(
+            "SELECT name, file_path FROM symbols WHERE LOWER(name) LIKE ?"
+          ).all(`%${word}%`) as any[];
+
+          for (const m of matches) {
+            const existing = fileScores.get(m.file_path) || { score: 0, matches: [] };
+            existing.score++;
+            if (!existing.matches.includes(m.name)) existing.matches.push(m.name);
+            fileScores.set(m.file_path, existing);
+          }
+        }
+
+        // Also boost files that are highly connected
+        for (const [filePath, data] of fileScores) {
+          const edgeCount = dbInst.prepare(
+            "SELECT COUNT(*) as c FROM edges WHERE source_fqn IN (SELECT fqn FROM symbols WHERE file_path = ?) OR target_fqn IN (SELECT fqn FROM symbols WHERE file_path = ?)"
+          ).get(filePath, filePath) as any;
+          data.score += Math.min(edgeCount.c / 10, 5); // bonus for connected files
+        }
+
+        const ranked = [...fileScores.entries()]
+          .sort((a, b) => b[1].score - a[1].score)
+          .slice(0, maxResults)
+          .map(([path, data]) => ({ path, score: Math.round(data.score * 10) / 10, matching_symbols: data.matches.slice(0, 5) }));
+
+        result = { task, suggestions: ranked };
+        break;
+      }
+      case "find_dead_code": {
+        const maxResults = Math.min(50, Math.max(1, (args?.max_results as number) || 20));
+        const dbInst = db.instance;
+
+        // Find symbols with zero inbound edges (nothing calls them)
+        const dead = dbInst.prepare(`
+          SELECT s.name, s.fqn, s.kind, s.file_path, s.start_line
+          FROM symbols s
+          WHERE s.kind IN ('function', 'class', 'method')
+            AND NOT EXISTS (SELECT 1 FROM edges WHERE target_fqn = s.fqn)
+            AND s.name NOT IN ('main', 'index', 'default', 'constructor')
+          ORDER BY s.name
+          LIMIT ?
+        `).all(maxResults) as any[];
+
+        result = { dead_symbols: dead, count: dead.length, note: "These symbols have zero inbound edges — nothing calls them." };
         break;
       }
       default:
