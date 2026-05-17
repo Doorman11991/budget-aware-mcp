@@ -1,12 +1,12 @@
 {
   "name": "budget-aware-mcp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": false,
   "type": "module",
   "description": "Model-agnostic code memory MCP server. Budget-aware graph retrieval for AI agents — sub-millisecond queries, token budgeting, no embeddings, no API keys. Built on CodeGraphContext for 155-language tree-sitter indexing.",
   "main": "dist/index.js",
   "bin": {
-    "code-graph-mcp": "dist/index.js"
+    "budget-aware-mcp": "dist/cli.js"
   },
   "files": [
     "dist/**/*",
