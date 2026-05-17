@@ -1,0 +1,597 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// code-graph-mcp — Model-Agnostic Code Memory via Graph Retrieval
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// A model-agnostic MCP server that gives any AI agent structured codebase
+// memory through hop-based graph walks. No embeddings, no vector DB, no
+// API keys. Pure graph retrieval over tree-sitter-parsed symbol graphs
+// stored in SQLite.
+//
+// Architecture:
+//   Agent (any MCP client) → code-graph-mcp (this system)
+//     → Retrieval Layer (graph walk, fuzzy discovery, scope check)
+//     → Index Layer (tree-sitter parsing, SQLite persistence, LZ4)
+//
+// Key differentiators:
+//   • Deterministic: same query always returns same result
+//   • Instant: sub-10ms p95 latency for repos under 100k LOC
+//   • Budget-aware: every query respects token budgets
+//   • Model-agnostic: works with Claude, GPT, Gemini, local models, anything
+//   • Zero dependencies: no embedding model, no cloud service
+//
+// Compile with:
+//   marrowc compile code_graph_mcp.marrow
+// ─────────────────────────────────────────────────────────────────────────────
+
+system CodeGraphMCP {
+  domain: developer_tools
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // ENTITIES
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  // A symbol node in the code graph (function, class, method, variable, type)
+  entity Symbol {
+    owns: [
+      name: string,
+      fqn: string,
+      kind: string,
+      file_path: string,
+      start_line: uint,
+      end_line: uint,
+      language: string,
+      signature: string,
+      docstring: string,
+      content_hash: string,
+      byte_size: uint
+    ]
+    constraints: [
+      name.length in 1..512,
+      kind in [
+        "function", "method", "class", "interface", "type",
+        "variable", "constant", "enum", "namespace", "module",
+        "constructor", "getter", "setter", "property"
+      ],
+      start_line >= 1,
+      end_line >= start_line
+    ]
+    states: pending -> indexed -> stale -> deleted
+    index: [fqn, file_path, kind, name]
+  }
+
+  // An edge in the code graph (import, call, inheritance, type reference)
+  entity Edge {
+    owns: [
+      source_fqn: string,
+      target_fqn: string,
+      kind: string,
+      weight: float,
+      file_path: string
+    ]
+    constraints: [
+      kind in [
+        "imports", "calls", "extends", "implements",
+        "type_ref", "instantiates", "overrides",
+        "reads", "writes", "tests", "configures"
+      ],
+      weight >= 0.0,
+      weight <= 1.0
+    ]
+    index: [source_fqn, target_fqn, kind]
+  }
+
+  // A file tracked in the index
+  entity IndexedFile {
+    owns: [
+      path: string,
+      language: string,
+      byte_size: uint,
+      line_count: uint,
+      content_hash: string,
+      last_indexed_at: timestamp,
+      symbol_count: uint
+    ]
+    constraints: [
+      path.length in 1..1024,
+      byte_size >= 0,
+      line_count >= 0
+    ]
+    states: pending -> indexed -> stale -> ignored | deleted
+    index: [path]
+  }
+
+  // A repo registered in the cross-repo graph
+  entity Repository {
+    owns: [
+      name: string,
+      root_path: string,
+      file_count: uint,
+      symbol_count: uint,
+      edge_count: uint,
+      total_loc: uint,
+      languages: list<string>,
+      last_indexed_at: timestamp,
+      index_duration_ms: uint
+    ]
+    constraints: [
+      name.length in 1..256,
+      root_path.length in 1..1024
+    ]
+    states: unindexed -> indexing -> indexed -> stale -> error
+    index: [name, root_path]
+  }
+
+  // Query result metadata — returned with every retrieval response
+  entity QueryMeta {
+    owns: [
+      tokens_returned: uint,
+      tokens_saved_vs_full_read: uint,
+      files_returned: uint,
+      symbols_returned: uint,
+      hops_traversed: uint,
+      query_ms: float,
+      budget_remaining: uint,
+      total_context_bytes: uint
+    ]
+    constraints: [
+      tokens_returned >= 0,
+      query_ms >= 0.0
+    ]
+  }
+
+  // Session-level token accounting
+  entity Session {
+    owns: [
+      session_id: string,
+      total_queries: uint,
+      total_tokens_returned: uint,
+      total_tokens_saved: uint,
+      total_files_touched: uint,
+      repos_queried: list<string>,
+      started_at: timestamp,
+      last_query_at: timestamp
+    ]
+    constraints: [
+      session_id.length in 1..128
+    ]
+    states: active -> idle -> expired
+    index: [session_id]
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // STORES
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  // SQLite for zero-config persistence. In-memory for speed, on-disk for
+  // durability. LZ4-compressed symbol content for large repos.
+  store SymbolStore {
+    engine: sqlite
+    schema: {
+      id: uint,
+      name: string,
+      fqn: string,
+      kind: string,
+      file_path: string,
+      start_line: uint,
+      end_line: uint,
+      language: string,
+      signature: string,
+      docstring: string,
+      content_hash: string,
+      byte_size: uint,
+      content_lz4: string,
+      repo_id: uint
+    }
+    partition: repo_id
+  }
+
+  store EdgeStore {
+    engine: sqlite
+    schema: {
+      id: uint,
+      source_fqn: string,
+      target_fqn: string,
+      kind: string,
+      weight: float,
+      file_path: string,
+      repo_id: uint
+    }
+    partition: repo_id
+  }
+
+  store FileStore {
+    engine: sqlite
+    schema: {
+      id: uint,
+      path: string,
+      language: string,
+      byte_size: uint,
+      line_count: uint,
+      content_hash: string,
+      last_indexed_at: timestamp,
+      symbol_count: uint,
+      repo_id: uint
+    }
+    partition: repo_id
+  }
+
+  store RepoStore {
+    engine: sqlite
+    schema: {
+      id: uint,
+      name: string,
+      root_path: string,
+      file_count: uint,
+      symbol_count: uint,
+      edge_count: uint,
+      total_loc: uint,
+      languages: json,
+      last_indexed_at: timestamp,
+      index_duration_ms: uint
+    }
+  }
+
+  store SessionStore {
+    engine: sqlite
+    schema: {
+      session_id: string,
+      total_queries: uint,
+      total_tokens_returned: uint,
+      total_tokens_saved: uint,
+      total_files_touched: uint,
+      repos_queried: json,
+      started_at: timestamp,
+      last_query_at: timestamp
+    }
+    retention: 7d
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // EVENTS
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  event RepoIndexed {
+    payload: {
+      repo_name: string,
+      root_path: string,
+      file_count: uint,
+      symbol_count: uint,
+      edge_count: uint,
+      duration_ms: uint,
+      indexed_at: timestamp
+    }
+    delivery: at_least_once
+    ttl: 30d
+  }
+
+  event QueryExecuted {
+    payload: {
+      session_id: string,
+      query_type: string,
+      anchor: string,
+      hop_depth: uint,
+      token_budget: uint,
+      tokens_returned: uint,
+      files_returned: uint,
+      query_ms: float
+    }
+    delivery: at_least_once
+    ttl: 7d
+  }
+
+  event IndexStale {
+    payload: {
+      repo_name: string,
+      changed_files: list<string>,
+      detected_at: timestamp
+    }
+    delivery: at_least_once
+    ttl: 1d
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // CAPABILITIES — Index Layer
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  // Index a repository: parse all files with tree-sitter, extract symbols
+  // and edges, persist to SQLite with LZ4 compression.
+  capability index_repo(path: string, name: string) {
+    requires: [
+      path.length >= 1
+    ]
+    effects: []
+    emits: RepoIndexed
+    sync: eventual
+    timeout: 5m
+    idempotent: true
+  }
+
+  // Incremental re-index: only re-parse files whose content_hash changed.
+  capability reindex_repo(repo: Repository) {
+    requires: [
+      repo.root_path.length >= 1
+    ]
+    effects: []
+    emits: RepoIndexed
+    sync: eventual
+    timeout: 5m
+    idempotent: true
+  }
+
+  // List all indexed repositories with stats.
+  capability list_repos() {
+    returns: list<Repository>
+    sync: eventual
+    idempotent: true
+  }
+
+  // Get per-repo statistics.
+  capability get_repo_stats(repo_name: string) {
+    requires: [repo_name.length >= 1]
+    returns: json
+    sync: eventual
+    idempotent: true
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // CAPABILITIES — Retrieval Layer (the differentiator)
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  // Core graph walk: BFS from anchor symbol(s), hop along edges,
+  // collect symbols until token budget is hit.
+  // Deterministic: alphabetical ordering within each hop level.
+  capability graph_walk(anchor: string, hop_depth: uint, max_tokens: uint) {
+    requires: [
+      anchor.length >= 1,
+      hop_depth >= 1,
+      hop_depth <= 10,
+      max_tokens >= 100,
+      max_tokens <= 200000
+    ]
+    returns: json
+    sync: eventual
+    timeout: 10s
+    idempotent: true
+  }
+
+  // Search the graph: resolve a query to symbols, then walk.
+  // Falls back to fuzzy discovery when exact anchor resolution fails.
+  capability search_graph(query: string, hop_depth: uint, max_tokens: uint) {
+    requires: [
+      query.length >= 1,
+      hop_depth >= 1,
+      hop_depth <= 10,
+      max_tokens >= 100
+    ]
+    returns: json
+    sync: eventual
+    timeout: 10s
+    idempotent: true
+  }
+
+  // Scope/feasibility check: "Is this task achievable with available context?"
+  // Returns feasibility assessment without calling any LLM.
+  capability check_scope(task_description: string, available_symbols: list<string>) {
+    requires: [
+      task_description.length >= 1
+    ]
+    returns: json
+    sync: eventual
+    timeout: 5s
+    idempotent: true
+  }
+
+  // Trace a call path between two symbols (follows call/import edges).
+  capability trace_call_path(from_symbol: string, to_symbol: string, max_hops: uint) {
+    requires: [
+      from_symbol.length >= 1,
+      to_symbol.length >= 1,
+      max_hops >= 1,
+      max_hops <= 20
+    ]
+    returns: json
+    sync: eventual
+    timeout: 10s
+    idempotent: true
+  }
+
+  // Impact analysis: given a git diff, find the blast radius in the graph.
+  capability analyze_impact(changed_files: list<string>, hop_depth: uint) {
+    requires: [
+      changed_files.size >= 1,
+      hop_depth >= 1,
+      hop_depth <= 5
+    ]
+    returns: json
+    sync: eventual
+    timeout: 30s
+    idempotent: true
+  }
+
+  // Change-aware retrieval: "What's changed since last query?"
+  capability get_changes_since(session_id: string, since_timestamp: timestamp) {
+    requires: [
+      session_id.length >= 1
+    ]
+    returns: json
+    sync: eventual
+    timeout: 10s
+    idempotent: true
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // CAPABILITIES — Fuzzy Discovery Layer
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  // Symbol name search: case-insensitive fuzzy match on function/class names.
+  // Splits camelCase/snake_case for broader matching.
+  capability fuzzy_find_symbol(query: string, max_results: uint) {
+    requires: [
+      query.length >= 1,
+      max_results >= 1,
+      max_results <= 100
+    ]
+    returns: list<Symbol>
+    sync: eventual
+    timeout: 5s
+    idempotent: true
+  }
+
+  // File path search: match against directory structure as domain signal.
+  capability find_by_path(path_pattern: string, max_results: uint) {
+    requires: [
+      path_pattern.length >= 1,
+      max_results >= 1
+    ]
+    returns: list<IndexedFile>
+    sync: eventual
+    timeout: 5s
+    idempotent: true
+  }
+
+  // Type signature search: "something that takes User and returns Token"
+  capability find_by_signature(param_types: list<string>, return_type: string) {
+    requires: [
+      param_types.size >= 1
+    ]
+    returns: list<Symbol>
+    sync: eventual
+    timeout: 5s
+    idempotent: true
+  }
+
+  // Discover major subsystems: top-N connected components by node count.
+  capability discover_subsystems(max_clusters: uint) {
+    requires: [
+      max_clusters >= 1,
+      max_clusters <= 50
+    ]
+    returns: json
+    sync: eventual
+    timeout: 30s
+    idempotent: true
+  }
+
+  // Structural similarity: "find code shaped like X" without embeddings.
+  // Matches by method-name patterns + type signatures.
+  capability find_similar(source_symbol: string, max_results: uint) {
+    requires: [
+      source_symbol.length >= 1,
+      max_results >= 1,
+      max_results <= 50
+    ]
+    returns: json
+    sync: eventual
+    timeout: 10s
+    idempotent: true
+  }
+
+  // Neighborhood expansion: hop=1 from a symbol — bridge from fuzzy to graph walk.
+  capability expand_neighborhood(symbol_fqn: string, max_tokens: uint) {
+    requires: [
+      symbol_fqn.length >= 1,
+      max_tokens >= 100
+    ]
+    returns: json
+    sync: eventual
+    timeout: 5s
+    idempotent: true
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // CAPABILITIES — Budget & Session Tracking
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  // Get session-level token accounting.
+  capability get_session_stats(session_id: string) {
+    requires: [session_id.length >= 1]
+    returns: json
+    sync: eventual
+    idempotent: true
+  }
+
+  // Reset session counters (start fresh accounting).
+  capability reset_session(session_id: string) {
+    requires: [session_id.length >= 1]
+    effects: []
+    sync: transactional
+    idempotent: true
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // CAPABILITIES — Cross-Repo Intelligence
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  // Add a new repo to the shared graph.
+  capability add_repo(path: string, name: string) {
+    requires: [
+      path.length >= 1,
+      name.length >= 1
+    ]
+    effects: []
+    emits: RepoIndexed
+    sync: eventual
+    timeout: 5m
+    idempotent: true
+  }
+
+  // Cross-repo call path: follows imports across repo boundaries.
+  capability trace_cross_repo_path(from_symbol: string, to_symbol: string) {
+    requires: [
+      from_symbol.length >= 1,
+      to_symbol.length >= 1
+    ]
+    returns: json
+    sync: eventual
+    timeout: 30s
+    idempotent: true
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // CAPABILITIES — Pipelines (composed retrieval workflows)
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  // The "I don't know what I'm looking for" pipeline:
+  // fuzzy search → pick most-connected → graph walk from best match.
+  capability discover_context(natural_query: string, max_tokens: uint) {
+    pipeline: {
+      fuzzy_find_symbol(natural_query, 10) as candidates
+      graph_walk(candidates, 2, max_tokens) as context
+      on_error: rollback
+    }
+    sync: eventual
+    timeout: 15s
+    idempotent: true
+  }
+
+  // Full retrieval with scope check: walk → assess feasibility → report.
+  capability retrieve_for_task(task: string, anchor: string, hop_depth: uint, max_tokens: uint) {
+    pipeline: {
+      graph_walk(anchor, hop_depth, max_tokens) as context
+      check_scope(task, context) as feasibility
+      on_error: rollback
+    }
+    sync: eventual
+    timeout: 20s
+    idempotent: true
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // POLICIES
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  // No rate limiting by default — this is a local tool.
+  // Token budgets are enforced per-query at the retrieval layer.
+  policy local_policy {
+    rate_limit: 1000 per 1m
+    audit: true
+    encryption: none
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // CONSTRAINTS
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  // Global invariants
+  constraint max_index_size: Repository.file_count <= 500000
+}

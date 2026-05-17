@@ -1,8 +1,7 @@
 node_modules/
 dist/
-*.js
-*.d.ts
-*.js.map
-.env
-*.sqlite
+.code-graph/
 *.db
+output/
+codebase-memory-mcp-main/
+*.log

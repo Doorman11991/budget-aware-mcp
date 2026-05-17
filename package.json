@@ -1,19 +1,48 @@
 {
   "name": "code-graph-mcp",
-  "version": "0.1.0",
-  "private": true,
-  "description": "Model-agnostic code intelligence MCP server. Graph-based retrieval for AI agents — no embeddings, no vector DB, no API keys.",
+  "version": "0.2.0",
+  "private": false,
+  "type": "module",
+  "description": "Model-agnostic code memory MCP server. Budget-aware graph retrieval for AI agents — sub-millisecond queries, token budgeting, no embeddings, no API keys. Built on CodeGraphContext for 155-language tree-sitter indexing.",
   "main": "dist/index.js",
   "bin": {
-    "code-graph-mcp": "dist/cli.js"
+    "code-graph-mcp": "dist/index.js"
   },
   "scripts": {
     "build": "tsc",
-    "dev": "ts-node src/cli.ts",
-    "test": "node --test dist/**/*.test.js"
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js",
+    "bench": "tsx bench/bench_inprocess.ts",
+    "bench:compare": "tsx bench/fair_benchmark.ts"
+  },
+  "keywords": [
+    "mcp",
+    "code-graph",
+    "ai-agent",
+    "code-intelligence",
+    "graph-retrieval",
+    "model-context-protocol",
+    "tree-sitter",
+    "sqlite",
+    "token-budget",
+    "codebase-memory"
+  ],
+  "repository": {
+    "type": "git",
+    "url": ""
   },
   "engines": {
     "node": ">=18.0.0"
   },
-  "license": "UNLICENSED"
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "better-sqlite3": "^11.5.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.11",
+    "@types/node": "^20.14.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.3"
+  },
+  "license": "MIT"
 }
