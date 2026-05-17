@@ -1,5 +1,5 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// code-graph-mcp — Model-Agnostic Code Memory via Graph Retrieval
+// budget-aware-mcp — Model-Agnostic Code Memory via Graph Retrieval
 // ─────────────────────────────────────────────────────────────────────────────
 //
 // A model-agnostic MCP server that gives any AI agent structured codebase

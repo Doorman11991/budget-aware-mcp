@@ -1,4 +1,4 @@
-# code-graph-mcp
+# budget-aware-mcp
 
 [![npm](https://img.shields.io/npm/v/budget-aware-mcp)](https://www.npmjs.com/package/budget-aware-mcp)
 
@@ -29,13 +29,14 @@ Any AI agent (Claude, Cursor, Kiro, Aider, Codex, Gemini CLI, etc.) gets structu
 
 ```bash
 npm install -g budget-aware-mcp
+budget-aware-mcp install
 ```
 
 Or from source:
 
 ```bash
-git clone https://github.com/Doorman11991/code-graph-mcp.git
-cd code-graph-mcp
+git clone https://github.com/Doorman11991/budget-aware-mcp.git
+cd budget-aware-mcp
 npm install
 npm run build
 ```
@@ -119,7 +120,7 @@ Config locations:
 ```
 AI Agent (any MCP client)
   ↓ stdio (JSON-RPC 2.0)
-code-graph-mcp (this project)
+budget-aware-mcp (this project)
   ├── Retrieval: graph_walk, fuzzy, scope_check, cluster, similarity
   ├── Reads: CodeGraphContext .db files (1500+ nodes, 4000+ edges)
   ├── Fallback: built-in regex parser (~30 languages)

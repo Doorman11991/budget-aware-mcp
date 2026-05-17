@@ -22,7 +22,7 @@ import { Indexer } from "./index/indexer.js";
 import { CbmStore } from "./index/cbm_store.js";
 
 const server = new Server(
-  { name: "code-graph-mcp", version: "0.2.0" },
+  { name: "budget-aware-mcp", version: "0.2.0" },
   { capabilities: { tools: {} } }
 );
 
