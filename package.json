@@ -1,0 +1,19 @@
+{
+  "name": "code-graph-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Model-agnostic code intelligence MCP server. Graph-based retrieval for AI agents — no embeddings, no vector DB, no API keys.",
+  "main": "dist/index.js",
+  "bin": {
+    "code-graph-mcp": "dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "ts-node src/cli.ts",
+    "test": "node --test dist/**/*.test.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "license": "UNLICENSED"
+}
