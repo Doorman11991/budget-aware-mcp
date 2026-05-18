@@ -21,6 +21,7 @@ import { SessionTracker } from "./tracking/session.js";
 import { Indexer } from "./index/indexer.js";
 import { CbmStore } from "./index/cbm_store.js";
 import { SemanticCache } from "./retrieval/semantic_cache.js";
+import { MemoryStore } from "./memory/store.js";
 
 const server = new Server(
   { name: "budget-aware-mcp", version: "0.2.0" },
@@ -35,6 +36,7 @@ const similarity = new SimilarityFinder(db);
 const sessions = new SessionTracker(db);
 const indexer = new Indexer(db);
 const queryCache = new SemanticCache(0.7, 200, 300_000); // 5 min TTL
+const memory = new MemoryStore();
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // TOOL DEFINITIONS
@@ -301,6 +303,95 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           name: { type: "string", description: "Repository name to delete" },
         },
         required: ["name"],
+      },
+    },
+    // ─── Memory Layer ────────────────────────────────────────────────────
+    {
+      name: "memory_load",
+      description: "Load relevant project memory for a task. Returns past decisions, workflows, conventions, and gotchas. Token-budgeted: stops collecting when budget is hit. Uses FTS5 + staleness decay + type boosting for relevance.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          task: { type: "string", description: "Task description to find relevant memory for" },
+          max_tokens: { type: "number", description: "Token budget for returned memory. Default: 2000", default: 2000 },
+        },
+        required: ["task"],
+      },
+    },
+    {
+      name: "memory_remember",
+      description: "Save durable knowledge to project memory. Use for decisions, workflows, gotchas, and conventions that should persist across sessions. NOT for task transcripts or temporary state.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          type: { type: "string", enum: ["decision", "workflow", "gotcha", "convention", "context", "source", "synthesis"], description: "Type of knowledge being stored" },
+          title: { type: "string", description: "Short descriptive title" },
+          content: { type: "string", description: "The knowledge to remember" },
+          tags: { type: "array", items: { type: "string" }, description: "Tags for retrieval" },
+          symbols: { type: "array", items: { type: "string" }, description: "Related code symbols (function/class names)" },
+          files: { type: "array", items: { type: "string" }, description: "Related file paths" },
+          supersedes: { type: "string", description: "ID of an existing memory to replace (deletes old, creates new)" },
+        },
+        required: ["type", "title", "content"],
+      },
+    },
+    {
+      name: "memory_update",
+      description: "Update an existing memory object's content, title, or tags in-place. Use when a decision or convention has changed but the memory ID should stay the same.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          id: { type: "string", description: "ID of the memory to update" },
+          title: { type: "string", description: "New title (optional, keeps existing if omitted)" },
+          content: { type: "string", description: "New content (optional, keeps existing if omitted)" },
+          tags: { type: "array", items: { type: "string" }, description: "New tags (optional, keeps existing if omitted)" },
+          symbols: { type: "array", items: { type: "string" }, description: "New symbols (optional)" },
+          files: { type: "array", items: { type: "string" }, description: "New files (optional)" },
+        },
+        required: ["id"],
+      },
+    },
+    {
+      name: "memory_list",
+      description: "List all stored project memory objects, optionally filtered by type.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          type: { type: "string", enum: ["decision", "workflow", "gotcha", "convention", "context", "source", "synthesis"], description: "Filter by memory type (optional)" },
+        },
+      },
+    },
+    {
+      name: "memory_for_symbol",
+      description: "Find all memory objects linked to a specific code symbol. Use when you need to understand decisions/conventions around a function or class.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          symbol: { type: "string", description: "Symbol name or FQN" },
+        },
+        required: ["symbol"],
+      },
+    },
+    {
+      name: "memory_for_file",
+      description: "Find all memory objects linked to a specific file. Use when you need to understand conventions/decisions for a file before editing it.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          file: { type: "string", description: "File path" },
+        },
+        required: ["file"],
+      },
+    },
+    {
+      name: "memory_forget",
+      description: "Delete a memory object by ID. Use when knowledge is outdated or wrong.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          id: { type: "string", description: "Memory object ID to delete" },
+        },
+        required: ["id"],
       },
     },
   ],
@@ -777,6 +868,96 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         dbInst.prepare("DELETE FROM repositories WHERE id = ?").run(repo.id);
 
         result = { deleted: repoName, message: "Repository and all its data removed from the graph." };
+        break;
+      }
+      // ─── Memory Layer ──────────────────────────────────────────────────
+      case "memory_load": {
+        const task = args?.task as string;
+        const maxTokens = Math.max(100, (args?.max_tokens as number) || 2000);
+        const { objects, tokens_used, score_breakdown } = memory.loadForTask(task, maxTokens);
+        if (objects.length === 0) {
+          result = { objects: [], tokens_used: 0, message: "No relevant memory found.", stats: memory.stats() };
+        } else {
+          result = {
+            objects: objects.map(o => ({ id: o.id, type: o.type, title: o.title, content: o.content, tags: o.tags, symbols: o.symbols, files: o.files })),
+            context: memory.formatForContext(objects, maxTokens),
+            count: objects.length,
+            tokens_used,
+            scoring: score_breakdown,
+          };
+        }
+        break;
+      }
+      case "memory_remember": {
+        const obj = memory.remember({
+          type: (args?.type as any) || "context",
+          title: args?.title as string,
+          content: args?.content as string,
+          tags: (args?.tags as string[]) || [],
+          symbols: (args?.symbols as string[]) || [],
+          files: (args?.files as string[]) || [],
+          supersedes: (args?.supersedes as string) || undefined,
+        });
+        if ("duplicate" in obj) {
+          result = { deduplicated: true, existing_id: obj.existing_id, message: "Near-identical memory already exists. Confirmed it as still valid." };
+        } else {
+          result = { remembered: { id: obj.id, type: obj.type, title: obj.title }, message: `Saved: [${obj.type}] ${obj.title}` };
+        }
+        break;
+      }
+      case "memory_list": {
+        const filterType = args?.type as string | undefined;
+        const objects = filterType ? memory.byType(filterType as any) : memory.all();
+        result = {
+          objects: objects.map(o => ({ id: o.id, type: o.type, title: o.title, tags: o.tags, createdAt: o.created_at })),
+          count: objects.length,
+          stats: memory.stats(),
+        };
+        break;
+      }
+      case "memory_for_symbol": {
+        const symbol = args?.symbol as string;
+        const objects = memory.forSymbol(symbol);
+        result = {
+          symbol,
+          objects: objects.map(o => ({ id: o.id, type: o.type, title: o.title, content: o.content })),
+          count: objects.length,
+        };
+        break;
+      }
+      case "memory_for_file": {
+        const file = args?.file as string;
+        const objects = memory.forFile(file);
+        result = {
+          file,
+          objects: objects.map(o => ({ id: o.id, type: o.type, title: o.title, content: o.content })),
+          count: objects.length,
+        };
+        break;
+      }
+      case "memory_forget": {
+        const id = args?.id as string;
+        const success = memory.forget(id);
+        result = success ? { deleted: id, message: "Memory object deleted." } : { error: `Memory ${id} not found.` };
+        break;
+      }
+      case "memory_update": {
+        const id = args?.id as string;
+        if (!id) {
+          return { content: [{ type: "text", text: JSON.stringify({ error: "Missing required parameter: id" }) }], isError: true };
+        }
+        const updated = memory.update(id, {
+          title: args?.title as string | undefined,
+          content: args?.content as string | undefined,
+          tags: args?.tags as string[] | undefined,
+          symbols: args?.symbols as string[] | undefined,
+          files: args?.files as string[] | undefined,
+        });
+        if (updated) {
+          result = { updated: { id: updated.id, type: updated.type, title: updated.title }, message: `Updated: [${updated.type}] ${updated.title}` };
+        } else {
+          result = { error: `Memory ${id} not found.` };
+        }
         break;
       }
       default:

@@ -303,13 +303,97 @@ if (args[0] === "install") {
   cmdInstall();
 } else if (args[0] === "uninstall") {
   cmdUninstall();
+} else if (args[0] === "view" || args[0] === "ui") {
+  // Launch the 3D spatial code graph + memory API
+  console.log("⚡ Code Graph Viewer");
+  console.log("");
+
+  // Start the memory API server (serves data to the 3D UI)
+  import("./memory/viewer.js").then(async ({ startViewer }) => {
+    const { MemoryStore } = await import("./memory/store.js");
+    const { db: graphDb } = await import("./db.js");
+    graphDb.initialize();
+    const store = new MemoryStore();
+    startViewer(store);
+  });
+
+  // Launch the 3D graph-ui (Vite dev server)
+  const selfDir = path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Z]:)/, "$1"));
+  const graphUiCandidates = [
+    path.resolve(selfDir, "..", "codebase-memory-mcp-main", "graph-ui"),
+    path.resolve(selfDir, "..", "..", "codebase-memory-mcp-main", "graph-ui"),
+    path.resolve(process.cwd(), "code-graph-mcp", "codebase-memory-mcp-main", "graph-ui"),
+    path.resolve(process.cwd(), "codebase-memory-mcp-main", "graph-ui"),
+  ];
+  const graphUiDir = graphUiCandidates.find(p => fs.existsSync(path.join(p, "package.json")));
+
+  if (graphUiDir) {
+    import("child_process").then(({ exec }) => {
+      const child = exec("npx vite --port 5173 --open", { cwd: graphUiDir });
+      child.stdout?.on("data", (d: string) => {
+        if (d.includes("Local:")) console.log(`  3D Graph: ${d.trim().split("Local:")[1]?.trim() || "http://localhost:5173"}`);
+      });
+      child.stderr?.on("data", () => {});
+      child.on("error", () => {
+        console.log("  3D Graph: could not start (run 'npm install' in graph-ui first)");
+      });
+      console.log("  Memory API: http://localhost:4321");
+      console.log("  Starting 3D graph...\n");
+    });
+  } else {
+    console.log("  3D graph-ui not found. Memory viewer at http://localhost:4321");
+    console.log("  Press Ctrl+C to stop.\n");
+    // Open the flat memory viewer instead
+    import("child_process").then(({ exec }) => {
+      if (process.platform === "win32") exec("start http://localhost:4321");
+      else if (process.platform === "darwin") exec("open http://localhost:4321");
+      else exec("xdg-open http://localhost:4321");
+    });
+  }
+} else if (args[0] === "memory") {
+  // CLI memory commands
+  import("./memory/store.js").then(({ MemoryStore }) => {
+    const store = new MemoryStore();
+    const sub = args[1];
+
+    if (!sub || sub === "list") {
+      const objects = store.all();
+      if (objects.length === 0) {
+        console.log("No memory stored yet.");
+        console.log("Use the memory_remember MCP tool to save decisions, workflows, and gotchas.");
+      } else {
+        console.log(`Project memory (${objects.length} objects):\n`);
+        for (const obj of objects) {
+          const age = Math.floor((Date.now() - new Date(obj.confirmed_at).getTime()) / 86400000);
+          console.log(`  [${obj.type}] ${obj.title} (${age}d old, ${obj.access_count} reads)`);
+        }
+      }
+    } else if (sub === "stats") {
+      const stats = store.stats();
+      console.log(`Memory: ${stats.total} objects`);
+      for (const [type, count] of Object.entries(stats.byType)) {
+        console.log(`  ${type}: ${count}`);
+      }
+    } else if (sub === "prune") {
+      const days = parseInt(args[2] || "90");
+      const pruned = store.pruneStale(days);
+      console.log(`Pruned ${pruned} stale memories (not confirmed in ${days}+ days).`);
+    } else {
+      console.log("Usage:");
+      console.log("  budget-aware-mcp memory         List all memory");
+      console.log("  budget-aware-mcp memory stats   Show statistics");
+      console.log("  budget-aware-mcp memory prune   Remove stale entries");
+    }
+  });
 } else if (args[0] === "--help" || args[0] === "-h") {
   console.log("budget-aware-mcp — Budget-aware code memory for AI agents\n");
   console.log("Usage:");
-  console.log("  budget-aware-mcp           Run MCP server on stdio");
-  console.log("  budget-aware-mcp install   Auto-detect agents and configure MCP");
-  console.log("  budget-aware-mcp uninstall Remove MCP config from all agents");
-  console.log("  budget-aware-mcp --help    Show this help");
+  console.log("  budget-aware-mcp             Run MCP server on stdio");
+  console.log("  budget-aware-mcp install     Auto-detect agents and configure MCP");
+  console.log("  budget-aware-mcp uninstall   Remove MCP config from all agents");
+  console.log("  budget-aware-mcp view        Open memory + graph viewer in browser");
+  console.log("  budget-aware-mcp memory      List/manage project memory (CLI)");
+  console.log("  budget-aware-mcp --help      Show this help");
   console.log("\nSupported agents:");
   console.log("  Kiro, Claude Code, Cursor, VS Code, Windsurf, Zed, Codex CLI, Gemini CLI, Aider, OpenCode");
 } else if (args[0] === "--version" || args[0] === "-v") {
